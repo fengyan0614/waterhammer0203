@@ -1,0 +1,334 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import os
+import glob
+from scipy.signal import find_peaks, butter, filtfilt
+from scipy.fft import fft, ifft
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
+
+# ==========================================
+# 1. 核心参数与全局样式设置
+# ==========================================
+data_dir = r"D:\movefromHP\研究生\新疆项目-超深层页岩油压裂缝网量化评价技术\水锤数据\Max5127原始数据局\新建文件夹"
+output_dir = os.path.join(data_dir, "水锤分析_V9.5_分贝版")
+if not os.path.exists(output_dir): os.makedirs(output_dir)
+
+V_SPACE = np.arange(1300, 1460, 1.0)
+T_SPACE = np.arange(0.5, 1.5, 0.1)
+MAX_ERR = 12.0
+WINDOW_SIZE, STEP_SIZE = 10.0, 1.0
+
+# 全局字体设为 20
+plt.rcParams.update({'font.size': 20})
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['axes.titlesize'] = 22
+plt.rcParams['axes.labelsize'] = 20
+plt.rcParams['xtick.labelsize'] = 20
+plt.rcParams['ytick.labelsize'] = 20
+plt.rcParams['legend.fontsize'] = 18
+
+# ===================== 新增：反射系数计算核心参数 =====================
+# 流体与井筒物理参数（可根据实际工况调整）
+FLUID_DENSITY = 1000.0  # 流体密度 ρ (kg/m³)，清水约1000
+WELLBORE_DIAMETER = 0.1143  # 井筒内径 (m)，4.5英寸井筒≈0.1143m
+WELLBORE_AREA = np.pi * (WELLBORE_DIAMETER / 2) ** 2  # 井筒截面积 A (m²)
+# 上游基准阻抗（井筒本身的特征阻抗）
+Zc1_BASE = FLUID_DENSITY * 1380 / WELLBORE_AREA  # 基于默认波速1380m/s
+
+# --- 射孔配置与光纤真值 ---
+stage_configs = {
+    "第4段": [6108.5, 6099.5, 6093.5, 6084.5, 6075.5, 6066.5],
+    "第11段": [5755.5, 5743.5, 5734.5, 5720.5], "第12段": [5703.5, 5690.5, 5681.0, 5664.0],
+    "第13段": [5652.5, 5640.5, 5628.5, 5617.5], "第14段": [5606.0, 5595.0, 5585.5, 5573.5],
+    "第15段": [5561.0, 5541.5, 5528.5], "第16段": [5516.0, 5508.0, 5499.0, 5487.5, 5482.0, 5476.0],
+    "第17段": [5461.0, 5448.5, 5437.5, 5428.0], "第18段": [5414.5, 5404.0, 5393.0, 5380.5],
+    "第19段": [5362.5, 5348.5, 5337.0, 5324.5], "第20段": [5313.5, 5302.0, 5284.5, 5274.0],
+    "第21段": [5258.0, 5247.0, 5235.0, 5223.5],
+}
+
+fiber_truth = {
+    "第4段": [0, 1, 0, 1, 1, 0], "第11段": [1, 1, 1, 0], "第12段": [1, 0, 1, 1],
+    "第13段": [1, 1, 1, 1], "第14段": [1, 1, 1, 0], "第15段": [0, 0, 1],
+    "第16段": [1, 0, 0, 1, 1, 0], "第17段": [1, 1, 0, 1], "第18段": [1, 1, 1, 0],
+    "第19段": [0, 1, 1, 1], "第20段": [1, 1, 1, 0], "第21段": [0, 1, 0, 1],
+}
+
+
+# ==========================================
+# 新增：反射系数计算核心函数
+# ==========================================
+def calculate_reflection_coefficient(p_filt, t_r, fs, detected_depths, best_v):
+    """
+    计算各射孔簇的反射系数R
+    :param p_filt: 滤波后的压力信号 (MPa)
+    :param t_r: 相对时间序列 (s)
+    :param fs: 采样频率 (Hz)
+    :param detected_depths: 识别到的射孔簇深度列表 (m)
+    :param best_v: 最优波速 (m/s)
+    :return: 各射孔簇的反射系数结果列表
+    """
+    # 1. 单位转换：压力从MPa转换为Pa，再转换为水头H (m) = P/(ρg)
+    g = 9.81  # 重力加速度 (m/s²)
+    p_pa = p_filt * 1e6  # MPa → Pa
+    H = p_pa / (FLUID_DENSITY * g)  # 水头 (m)
+
+    # 2. 计算流量Q：基于水锤波传播的连续性方程
+    dH_dt = np.gradient(H, t_r)  # 水头时间导数
+    Q = (WELLBORE_AREA * g / best_v) * dH_dt  # 井筒流量 (m³/s)
+
+    # 3. 计算各射孔簇对应的反射系数
+    reflection_results = []
+    for depth in detected_depths:
+        if depth is None:
+            reflection_results.append(None)
+            continue
+
+        # 计算该深度对应的时间窗口（波速*时间/2=深度 → 时间=2*深度/波速）
+        target_time = 2 * depth / best_v
+        # 找到该时间附近的信号窗口（±0.1s）
+        time_window = (t_r >= target_time - 0.1) & (t_r <= target_time + 0.1)
+
+        if not np.any(time_window):
+            reflection_results.append(None)
+            continue
+
+        # 计算特征阻抗Zc2 = ΔP/ΔQ (Pa·s/m³ = kg/(m²·s))
+        delta_P = np.std(p_pa[time_window])  # 压力波动幅值 (Pa)
+        delta_Q = np.std(Q[time_window])  # 流量波动幅值 (m³/s)
+
+        if delta_Q < 1e-8:  # 避免除零
+            reflection_results.append(None)
+            continue
+
+        Zc2 = delta_P / delta_Q
+        # 反射系数核心公式：R = (Zc2 - Zc1) / (Zc2 + Zc1)
+        R = (Zc2 - Zc1_BASE) / (Zc2 + Zc1_BASE)
+        reflection_results.append(round(R, 3))  # 保留3位小数
+
+    return reflection_results
+
+
+# ==========================================
+# 2. 核心处理引擎（原有逻辑完全保留）
+# ==========================================
+def get_signal_data(file_path):
+    df = pd.read_csv(file_path, header=None)
+    t_full, p_full = df.iloc[:, 0].values, df.iloc[:, 1].values
+    fs = 1.0 / np.median(np.diff(t_full))
+    p_smooth = pd.Series(p_full).rolling(window=int(fs), min_periods=1).mean().values
+    high_idx = np.where(p_smooth > 95.0)[0]
+    shut_idx = high_idx[-1] + np.where(p_smooth[high_idx[-1]:] < 80.0)[0][0] if len(high_idx) > 0 else np.argmin(
+        np.gradient(p_full))
+    start, end = max(0, shut_idx - int(2 * fs)), min(len(t_full), shut_idx + int(80 * fs))
+    p_filt = filtfilt(*butter(4, [2.5 / (0.5 * fs), 30.0 / (0.5 * fs)], btype='band'), p_full[start:end])
+
+    # 核心计算：分贝化 (dB)
+    cep = ifft(20 * np.log10(np.abs(fft(p_filt)) + 1e-10)).real
+    return t_full, p_full, t_full[start:end], (t_full[start:end] - t_full[start]), p_filt, np.arange(
+        len(cep)) / fs, cep, fs
+
+
+def solve_stage_grid(que, cep, targets, truth_list):
+    best_acc, best_params, best_results = -1, {}, []
+    neg_cep = -cep
+    roi = ((1380 * que) / 2 > min(targets) - 80) & ((1380 * que) / 2 < max(targets) + 80)
+    mad = np.median(np.abs(neg_cep[roi] - np.median(neg_cep[roi])))
+    for v in V_SPACE:
+        for t_m in T_SPACE:
+            thr = max(0.0002, mad * t_m)
+            peaks, _ = find_peaks(neg_cep[roi], height=thr, width=1.0)
+            p_d, p_a, p_q = (v * que[roi][peaks]) / 2, cep[roi][peaks], que[roi][peaks]
+            bids = sorted([{'s': (-p_a[j]) * np.exp(-(abs(p_d[j] - targets[i]) ** 2) / (2 * 8 ** 2)), 'c': i, 'p': j}
+                           for i in range(len(targets)) for j in range(len(p_d)) if
+                           abs(p_d[j] - targets[i]) <= MAX_ERR],
+                          key=lambda x: x['s'], reverse=True)
+            res_wh, details, a_c, a_p = [0] * len(targets), [None] * len(targets), set(), set()
+            for b in bids:
+                if b['c'] not in a_c and b['p'] not in a_p:
+                    a_c.add(b['c']);
+                    a_p.add(b['p']);
+                    res_wh[b['c']] = 1
+                    details[b['c']] = {'d': round(p_d[b['p']], 1), 'e': round(p_d[b['p']] - targets[b['c']], 1),
+                                       'q': p_q[b['p']], 'a': p_a[b['p']]}
+            acc = sum(1 for k in range(len(res_wh)) if res_wh[k] == truth_list[k]) / len(targets)
+            if acc > best_acc or (acc == best_acc and abs(v - 1380) < abs(best_params.get('v', 1380) - 1380)):
+                best_acc, best_params, best_results = acc, {'v': v, 't': thr}, [
+                    {'wh': "开启" if res_wh[m] == 1 else "未识别", 'info': details[m]} for m in range(len(targets))]
+    return best_acc, best_params, best_results
+
+
+# ==========================================
+# 3. 绘图主流程（新增反射系数列和汇总表）
+# ==========================================
+if __name__ == "__main__":
+    all_files = glob.glob(os.path.join(data_dir, "*.csv"))
+
+    # 用于汇总所有段的结果（新增反射系数）
+    all_summary = []
+
+    for stage, targets in stage_configs.items():
+        f_path = next((f for f in all_files if stage in f), None)
+        if not f_path: continue
+        t_f, p_f, t_a, t_r, p_filt, que, cep, fs = get_signal_data(f_path)
+        acc, params, results = solve_stage_grid(que, cep, targets, fiber_truth[stage])
+        best_v = params['v']
+
+        # ===================== 新增：计算反射系数 =====================
+        # 提取识别到的射孔簇深度
+        detected_depths = [r['info']['d'] if r['info'] else None for r in results]
+        # 计算各簇反射系数
+        reflection_coeffs = calculate_reflection_coefficient(p_filt, t_r, fs, detected_depths, best_v)
+
+        # --- 图表 1: 定位（原有逻辑完全保留）---
+        fig1, (ax1a, ax1b) = plt.subplots(2, 1, figsize=(20, 12))
+        ax1a.plot(t_f, p_f, color='#95a5a6', lw=1.0, label='高频压力数据')
+        ax1a.axvspan(t_a[0], t_a[-1], color='gold', alpha=0.3, label='水锤响应区域')
+        ax1a.set_title(f"【{stage}】定位 (吻合度: {acc:.1%})", fontweight='bold')
+        ax1a.set_ylabel("压力 (MPa)");
+        ax1a.legend(loc='upper right');
+        ax1a.margins(x=0);
+        ax1a.set_xlim(left=0)
+        ax1b.plot(t_r, p_filt, color='#2980b9', lw=1.5, label='水锤压力数据');
+        ax1b.set_ylabel("波动增量 (MPa)");
+        ax1b.set_xlabel("时间 (s)");
+        ax1b.margins(x=0)
+        ax1b.legend(loc='upper right')
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig1_定位.png"), dpi=200, bbox_inches='tight')
+
+        # --- 图表 2: 精修降噪倒谱（新增反射系数列）---
+        fig2 = plt.figure(figsize=(20, 16))
+        gs2 = gridspec.GridSpec(2, 1, height_ratios=[1, 0.8], hspace=0.35)
+        ax2a = fig2.add_subplot(gs2[0])
+        q_min, q_max = 2 * (min(targets) - 5) / params['v'], 2 * (max(targets) + 5) / params['v']
+        idx_range = (que >= q_min) & (que <= q_max)
+
+        # 压制处理（原有逻辑）
+        cep_clean = cep.copy()
+        mask = np.ones_like(cep_clean) * 0.05
+        for r in results:
+            if r['wh'] == "开启":
+                c_idx = np.argmin(np.abs(que - r['info']['q']))
+                w = int(0.015 * fs)
+                mask[c_idx - w: c_idx + w] = 1.0
+        cep_display = gaussian_filter1d(cep_clean * mask, sigma=1)
+
+        ax2a.plot(que[idx_range], cep_display[idx_range], color='k', lw=2.5)
+        ax2a.axhline(0, color='gray', lw=1.5, ls='--')
+        for r in results:
+            if r['wh'] == "开启":
+                qp, ap = r['info']['q'], r['info']['a']
+                ax2a.vlines(qp, 0, ap, colors='k', linestyles=':', lw=2)
+                ax2a.scatter(qp, ap, color='red', s=250, marker='v', zorder=5)
+                ax2a.text(qp, ap - 0.001, f"{qp:.3f}", ha='center', va='top', fontsize=20, fontweight='bold')
+
+        ax2a.set_title(f"【{stage}】倒谱特征提取", fontweight='bold')
+        ax2a.set_xlabel("倒频率 (s)")
+        ax2a.set_ylabel("倒谱幅值 (dB)")
+        ax2a.set_xlim(q_min, q_max)
+        ax2a.set_ylim(-0.02, 0.02)  # 保留原有Y轴范围锁定
+
+        ax2b = fig2.add_subplot(gs2[1]);
+        ax2b.axis('off')
+        # ===================== 核心修改：表格新增反射系数列 =====================
+        table_data = []
+        for i, r in enumerate(results):
+            # 反射系数值（无数据则显示--）
+            r_val = f"{reflection_coeffs[i]:.3f}" if reflection_coeffs[i] is not None else "--"
+            table_data.append([
+                f"第{i + 1}簇",
+                f"{targets[i]:.1f}",
+                r['wh'],
+                f"{r['info']['d']:.1f}" if r['info'] else "--",
+                f"{r['info']['e']:.1f}" if r['info'] else "--",
+                r_val  # 新增反射系数列
+            ])
+
+        # 表格列名按要求设置（包含LaTeX格式的单位）
+        tab = ax2b.table(
+            cellText=table_data,
+            colLabels=["簇号", f"设计深度($m$)", "识别结果", f"实测深度($m$)", f"计算误差($m$)", f"反射系数$R$"],
+            loc='center',
+            cellLoc='center'
+        )
+        tab.auto_set_font_size(False);
+        tab.set_fontsize(20);
+        tab.scale(1, 4.0)
+        # 表格样式优化（高亮表头+R<0的单元格）
+        for (ri, ci), cell in tab.get_celld().items():
+            if ri == 0:
+                cell.set_facecolor('#34495e');
+                cell.set_text_props(color='white', weight='bold')
+            # 高亮R<0的单元格（裂缝导流能力强）
+            if ri > 0 and ci == 5 and cell.get_text().get_text() != "--":
+                r_val = float(cell.get_text().get_text())
+                if r_val < 0:
+                    cell.set_facecolor('#e74c3c');
+                    cell.set_text_props(color='white', weight='bold')
+
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig2_倒谱.png"), dpi=200, bbox_inches='tight')
+
+        # --- 图表 3: 热力图（原有逻辑完全保留）---
+        fig3, ax3 = plt.subplots(figsize=(20, 8))
+        win, step = int(WINDOW_SIZE * fs), int(STEP_SIZE * fs)
+        mat = np.array([ifft(20 * np.log10(np.abs(fft(p_filt[i * step: i * step + win])) + 1e-10)).real for i in
+                        range(int((len(p_filt) - win) / step))]).T
+        v_d = (params['v'] * (np.arange(win) / fs)) / 2
+        m_h = (v_d > min(targets) - 60) & (v_d < max(targets) + 60)
+        im = ax3.imshow(gaussian_filter(mat[m_h, :], 1.5), aspect='auto', cmap='RdBu_r',
+                        extent=[0, mat.shape[1] * STEP_SIZE, v_d[m_h][-1], v_d[m_h][0]],
+                        vmin=np.percentile(mat[m_h, :], 5), vmax=np.percentile(mat[m_h, :], 95))
+        ax3.invert_yaxis()
+        for i, r in enumerate(results):
+            if r['wh'] == "开启":
+                ax3.axhline(r['info']['d'], color='gold', lw=5, ls='-')
+                ax3.text(2, r['info']['d'] + 2.5, f"第{i + 1}簇", color='red', fontweight='bold', fontsize=22)
+        ax3.set_title(f"【{stage}】时空演化评价图", fontweight='bold')
+        ax3.set_ylabel("深度 (m)");
+        ax3.set_xlabel("监测时间 (s)")
+        divider = make_axes_locatable(ax3)
+        cax = divider.append_axes("right", size="2%", pad=0.1)
+        cbar = plt.colorbar(im, cax=cax)
+        cbar.ax.tick_params(labelsize=20)
+        cbar.set_label('倒谱幅值 (dB)', fontsize=22, fontweight='bold', labelpad=20)
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig3_热力图.png"), dpi=200, bbox_inches='tight')
+
+        # ===================== 新增：汇总数据用于生成CSV =====================
+        stage_summary = {
+            "段名": stage,
+            "最优波速(best_v)": best_v,
+            "识别吻合度": round(acc, 3),
+            "射孔簇详情": []
+        }
+        for i, r in enumerate(results):
+            stage_summary["射孔簇详情"].append({
+                "簇号": i + 1,
+                "设计深度(m)": targets[i],
+                "实测深度(m)": r['info']['d'] if r['info'] else None,
+                "识别结果": r['wh'],
+                "计算误差(m)": r['info']['e'] if r['info'] else None,
+                "光纤真值": fiber_truth[stage][i],
+                "反射系数R": reflection_coeffs[i]
+            })
+        all_summary.append(stage_summary)
+
+        plt.close('all')
+
+    # ===================== 生成阻抗分析汇总表.csv =====================
+    # 展开汇总数据为扁平结构
+    summary_df = pd.json_normalize(
+        [item for stage in all_summary for item in stage["射孔簇详情"]],
+        meta=[["段名"], ["最优波速(best_v)"], ["识别吻合度"]]
+    )
+    # 保存CSV（UTF-8编码避免乱码）
+    summary_df.to_csv(os.path.join(output_dir, "阻抗分析汇总表.csv"), index=False, encoding='utf-8-sig')
+
+    print(f"✨ 任务完成！所有修改已生效：")
+    print(f"   1. 倒谱表格新增「反射系数$R$」列，列名按要求设置为LaTeX格式")
+    print(f"   2. R<0的单元格已标红（代表裂缝导流能力强）")
+    print(f"   3. 生成「阻抗分析汇总表.csv」，包含所有段/簇的反射系数数据")
+    print(f"   4. 所有原有图表样式、逻辑完全保留")
+    print(f"   结果保存至: {output_dir}")

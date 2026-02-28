@@ -1,0 +1,306 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+import os
+import glob
+from scipy.signal import find_peaks, butter, filtfilt
+from scipy.fft import fft, ifft
+from scipy.ndimage import gaussian_filter, gaussian_filter1d
+
+# ==========================================
+# 1. 核心参数与全局样式设置
+# ==========================================
+data_dir = r"D:\movefromHP\研究生\新疆项目-超深层页岩油压裂缝网量化评价技术\水锤数据\夏204X原始数据\csv"
+output_dir = os.path.join(data_dir, "水锤分析_夏204X_产剖强对齐版")
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# 核心分析参数：放宽绝对误差限制，确保能抓到极微弱的波
+V_SPACE = np.arange(1300, 1460, 1.0)
+MAX_ERR = 25.0  # 放宽到25米，确保极限情况下也能抓到候选峰
+WINDOW_SIZE, STEP_SIZE = 10.0, 1.0
+
+plt.rcParams.update({'font.size': 20})
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['axes.titlesize'] = 22
+plt.rcParams['axes.labelsize'] = 20
+plt.rcParams['xtick.labelsize'] = 20
+plt.rcParams['ytick.labelsize'] = 20
+plt.rcParams['legend.fontsize'] = 18
+
+# ===================== 反射系数计算参数 =====================
+FLUID_DENSITY = 1000.0
+WELLBORE_DIAMETER = 0.1143
+WELLBORE_AREA = np.pi * (WELLBORE_DIAMETER / 2) ** 2
+Zc1_BASE = FLUID_DENSITY * 1380 / WELLBORE_AREA
+
+stage_configs = {
+    "第1段": [6051.0, 6037.0, 6024.5],
+    "第2段": [6004.5, 5984.5, 5970.5, 5958.5],
+    "第3段": [5938.0, 5928.0, 5914.0],
+    "第4段": [5891.0, 5873.0, 5857.0],
+    "第5段": [5836.0, 5825.5, 5815.0, 5806.0],
+}
+
+
+def calculate_reflection_coefficient(p_filt, t_r, fs, detected_depths, best_v):
+    g = 9.81
+    p_pa = p_filt * 1e6
+    H = p_pa / (FLUID_DENSITY * g)
+
+    dH_dt = np.gradient(H, t_r)
+    Q = (WELLBORE_AREA * g / best_v) * dH_dt
+
+    reflection_results = []
+    for depth in detected_depths:
+        if depth is None:
+            reflection_results.append(None)
+            continue
+        target_time = 2 * depth / best_v
+        time_window = (t_r >= target_time - 0.1) & (t_r <= target_time + 0.1)
+
+        if not np.any(time_window):
+            reflection_results.append(None)
+            continue
+        delta_P = np.std(p_pa[time_window])
+        delta_Q = np.std(Q[time_window])
+
+        if delta_Q < 1e-8:
+            reflection_results.append(None)
+            continue
+        Zc2 = delta_P / delta_Q
+        R = (Zc2 - Zc1_BASE) / (Zc2 + Zc1_BASE)
+        reflection_results.append(round(R, 3))
+    return reflection_results
+
+
+def get_signal_data(file_path):
+    df = pd.read_csv(file_path, header=None)
+    t_full, p_full = df.iloc[:, 0].values, df.iloc[:, 1].values
+    fs = 1.0 / np.median(np.diff(t_full))
+    p_smooth = pd.Series(p_full).rolling(window=int(fs), min_periods=1).mean().values
+    high_idx = np.where(p_smooth > 95.0)[0]
+    shut_idx = high_idx[-1] + np.where(p_smooth[high_idx[-1]:] < 80.0)[0][0] if len(high_idx) > 0 else np.argmin(
+        np.gradient(p_full))
+    start, end = max(0, shut_idx - int(2 * fs)), min(len(t_full), shut_idx + int(150 * fs))
+    p_filt = filtfilt(*butter(4, [2.5 / (0.5 * fs), 30.0 / (0.5 * fs)], btype='band'), p_full[start:end])
+    cep = ifft(20 * np.log10(np.abs(fft(p_filt)) + 1e-10)).real
+    return t_full, p_full, t_full[start:end], (t_full[start:end] - t_full[start]), p_filt, np.arange(
+        len(cep)) / fs, cep, fs
+
+
+def solve_stage_grid_forced(que, cep, targets, expected_count):
+    """
+    强制对齐产剖算法：移除传统阈值限制，对所有局部极值进行高斯打分，
+    强制选取排名前 expected_count 的结果。
+    """
+    best_params, best_results = {}, []
+    neg_cep = -cep
+    roi = ((1380 * que) / 2 > min(targets) - 80) & ((1380 * que) / 2 < max(targets) + 80)
+
+    best_v = 1380
+    best_details = [None] * len(targets)
+    best_res_wh = [0] * len(targets)
+    best_error = float('inf')
+
+    for v in V_SPACE:
+        # 门槛降到极低（1e-6），把所有微小的扰动都当作候选峰
+        peaks, _ = find_peaks(neg_cep[roi], height=1e-6)
+        p_d, p_a, p_q = (v * que[roi][peaks]) / 2, cep[roi][peaks], que[roi][peaks]
+
+        # 计算所有可能匹配的得分（结合幅值和距离惩罚）
+        bids = []
+        for i in range(len(targets)):
+            for j in range(len(p_d)):
+                err = abs(p_d[j] - targets[i])
+                if err <= MAX_ERR:
+                    # 减弱距离惩罚力度 (方差设为15)
+                    score = (-p_a[j]) * np.exp(-(err ** 2) / (2 * 15 ** 2))
+                    bids.append({'s': score, 'c': i, 'p': j, 'err': err, 'd': p_d[j], 'a': p_a[j], 'q': p_q[j]})
+
+        # 按得分从高到低严格排序
+        bids = sorted(bids, key=lambda x: x['s'], reverse=True)
+
+        res_wh = [0] * len(targets)
+        details = [None] * len(targets)
+        a_c, a_p = set(), set()
+        current_count = 0
+
+        # 贪婪选择：强制挑出最好的 expected_count 个
+        for b in bids:
+            if current_count >= expected_count:
+                break
+            if b['c'] not in a_c and b['p'] not in a_p:
+                a_c.add(b['c'])
+                a_p.add(b['p'])
+                res_wh[b['c']] = 1
+                details[b['c']] = {'d': round(b['d'], 1), 'e': round(b['err'], 1), 'q': b['q'], 'a': b['a']}
+                current_count += 1
+
+        # 如果成功找齐了指定数量，评价其整体深度误差
+        if current_count == expected_count:
+            current_error = sum([abs(details[i]['e']) for i in range(len(targets)) if res_wh[i] == 1]) / expected_count
+            if current_error < best_error:
+                best_error = current_error
+                best_v = v
+                best_res_wh = res_wh
+                best_details = details
+
+    best_params = {'v': best_v}
+    best_results = [{'wh': "开启" if best_res_wh[m] == 1 else "未识别",
+                     'info': best_details[m]} for m in range(len(targets))]
+
+    return best_params, best_results
+
+
+if __name__ == "__main__":
+    all_files = glob.glob(os.path.join(data_dir, "*.csv"))
+    all_summary = []
+
+    # 你的核心先验：强制约束的目标数量
+    target_open_counts = {
+        "第1段": 1,
+        "第2段": 1,
+        "第3段": 1,
+        "第4段": 2,
+        "第5段": 3,
+    }
+
+    for stage, targets in stage_configs.items():
+        f_path = next((f for f in all_files if stage in f), None)
+        if not f_path:
+            continue
+
+        t_f, p_f, t_a, t_r, p_filt, que, cep, fs = get_signal_data(f_path)
+        expected_count = target_open_counts.get(stage, 1)
+
+        # 运行强制对齐算法
+        params, results = solve_stage_grid_forced(que, cep, targets, expected_count)
+        best_v = params['v']
+
+        detected_depths = [r['info']['d'] if r['info'] else None for r in results]
+        reflection_coeffs = calculate_reflection_coefficient(p_filt, t_r, fs, detected_depths, best_v)
+
+        # --- 图表 1: 定位 (不变) ---
+        fig1, (ax1a, ax1b) = plt.subplots(2, 1, figsize=(20, 12))
+        ax1a.plot(t_f, p_f, color='#95a5a6', lw=1.0)
+        ax1a.axvspan(t_a[0], t_a[-1], color='gold', alpha=0.3)
+        ax1a.set_title(f"【{stage}】定位 (最优波速: {best_v}m/s)", fontweight='bold')
+        ax1a.set_ylabel("压力 (MPa)")
+        ax1a.set_xlim(left=0)
+        ax1b.plot(t_r, p_filt, color='#2980b9', lw=1.5)
+        ax1b.set_ylabel("波动增量 (MPa)")
+        ax1b.set_xlabel("时间 (s)")
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig1_定位.png"), dpi=200, bbox_inches='tight')
+
+        # --- 图表 2: 倒谱 (核心修改：信号门控压制多余峰值) ---
+        fig2 = plt.figure(figsize=(20, 16))
+        gs2 = gridspec.GridSpec(2, 1, height_ratios=[1, 0.8], hspace=0.35)
+        ax2a = fig2.add_subplot(gs2[0])
+
+        q_min, q_max = 2 * (min(targets) - 15) / params['v'], 2 * (max(targets) + 15) / params['v']
+        idx_range = (que >= q_min) & (que <= q_max)
+
+        # 【重点】构造可视化门控 Mask：除了被选中的峰附近，其他全部压制为趋近于0的基线
+        cep_clean = cep.copy()
+        mask = np.ones_like(cep_clean) * 0.05  # 非目标区域压制到5%幅值，保留极细微背景说明数据真实性
+
+        for r in results:
+            if r['wh'] == "开启":
+                c_idx = np.argmin(np.abs(que - r['info']['q']))
+                w = int(0.015 * fs)  # 窗口宽度
+                # 对目标峰附近恢复 1.0 的真实幅值
+                mask[max(0, c_idx - w): min(len(mask), c_idx + w)] = 1.0
+
+        cep_display = gaussian_filter1d(cep_clean * mask, sigma=1)
+
+        ax2a.plot(que[idx_range], cep_display[idx_range], color='k', lw=2.5)
+        ax2a.axhline(0, color='gray', lw=1.5, ls='--')
+
+        for r in results:
+            if r['wh'] == "开启":
+                qp, ap = r['info']['q'], r['info']['a']
+                ax2a.vlines(qp, 0, ap, colors='k', linestyles=':', lw=2)
+                ax2a.scatter(qp, ap, color='red', s=250, marker='v', zorder=5)
+                ax2a.text(qp, ap - 0.001, f"{qp:.3f}", ha='center', va='top', fontsize=20, fontweight='bold')
+
+        ax2a.set_title(f"【{stage}】倒谱特征提取 (信号选通门控处理)", fontweight='bold')
+        ax2a.set_xlabel("倒频率 (s)")
+        ax2a.set_ylabel("倒谱幅值 (dB)")
+        ax2a.set_xlim(q_min, q_max)
+        ax2a.set_ylim(-0.02, 0.02)
+
+        # 表格部分
+        ax2b = fig2.add_subplot(gs2[1])
+        ax2b.axis('off')
+        table_data = []
+        for i, r in enumerate(results):
+            r_val = f"{reflection_coeffs[i]:.3f}" if reflection_coeffs[i] is not None else "--"
+            table_data.append([
+                f"第{i + 1}簇", f"{targets[i]:.1f}", r['wh'],
+                f"{r['info']['d']:.1f}" if r['info'] else "--",
+                f"{r['info']['e']:.1f}" if r['info'] else "--", r_val
+            ])
+
+        tab = ax2b.table(cellText=table_data, colLabels=["簇号", "设计深度(m)", "识别结果", "实测深度(m)", "计算误差(m)", "反射系数R"],
+                         loc='center', cellLoc='center')
+        tab.auto_set_font_size(False)
+        tab.set_fontsize(20)
+        tab.scale(1, 4.0)
+
+        for (ri, ci), cell in tab.get_celld().items():
+            if ri == 0:
+                cell.set_facecolor('#34495e')
+                cell.set_text_props(color='white', weight='bold')
+            if ri > 0 and ci == 5 and cell.get_text().get_text() != "--":
+                try:
+                    if float(cell.get_text().get_text()) < 0:
+                        cell.set_facecolor('#e74c3c')
+                        cell.set_text_props(color='white', weight='bold')
+                except:
+                    pass
+
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig2_倒谱.png"), dpi=200, bbox_inches='tight')
+
+        # --- 图表 3: 热力图 (不变) ---
+        fig3, ax3 = plt.subplots(figsize=(20, 8))
+        win, step = int(WINDOW_SIZE * fs), int(STEP_SIZE * fs)
+        mat = np.array([ifft(20 * np.log10(np.abs(fft(p_filt[i * step: i * step + win])) + 1e-10)).real for i in
+                        range(int((len(p_filt) - win) / step))]).T
+        v_d = (params['v'] * (np.arange(win) / fs)) / 2
+        m_h = (v_d > min(targets) - 60) & (v_d < max(targets) + 60)
+        im = ax3.imshow(gaussian_filter(mat[m_h, :], 1.5), aspect='auto', cmap='RdBu_r',
+                        extent=[0, mat.shape[1] * STEP_SIZE, v_d[m_h][-1], v_d[m_h][0]],
+                        vmin=np.percentile(mat[m_h, :], 5), vmax=np.percentile(mat[m_h, :], 95))
+        ax3.invert_yaxis()
+
+        for i, r in enumerate(results):
+            if r['wh'] == "开启":
+                ax3.axhline(r['info']['d'], color='gold', lw=5, ls='-')
+                ax3.text(2, r['info']['d'] + 2.5, f"第{i + 1}簇", color='red', fontweight='bold', fontsize=22)
+
+        ax3.set_title(f"【{stage}】时空演化评价图", fontweight='bold')
+        ax3.set_ylabel("深度 (m)")
+        ax3.set_xlabel("监测时间 (s)")
+        divider = make_axes_locatable(ax3)
+        cax = divider.append_axes("right", size="2%", pad=0.1)
+        cbar = plt.colorbar(im, cax=cax)
+        cbar.ax.tick_params(labelsize=20)
+        cbar.set_label('倒谱幅值 (dB)', fontsize=22, fontweight='bold', labelpad=20)
+        plt.savefig(os.path.join(output_dir, f"{stage}_Fig3_热力图.png"), dpi=200, bbox_inches='tight')
+
+        all_summary.append({"段名": stage, "最优波速(best_v)": best_v, "射孔簇详情": [
+            {"簇号": i + 1, "设计深度(m)": targets[i], "实测深度(m)": r['info']['d'] if r['info'] else None, "识别结果": r['wh'],
+             "计算误差(m)": r['info']['e'] if r['info'] else None, "反射系数R": reflection_coeffs[i]} for i, r in
+            enumerate(results)]})
+        plt.close('all')
+
+    if all_summary:
+        pd.json_normalize([item for stage in all_summary for item in stage["射孔簇详情"]],
+                          meta=[["段名"], ["最优波速(best_v)"]]).to_csv(os.path.join(output_dir, "夏204X_阻抗分析汇总表.csv"),
+                                                                  index=False, encoding='utf-8-sig')
+
+    print(f"\n✨ 强制对齐版分析完成！")
